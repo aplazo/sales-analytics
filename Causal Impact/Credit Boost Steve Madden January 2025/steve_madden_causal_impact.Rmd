@@ -1,0 +1,793 @@
+---
+title: "Causal Impact Analysis: Steve Madden Credit Booster"
+subtitle: "Measuring the incremental effect on originated loans"
+author: "BNPL Analytics Team"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 12
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.path = "outputs/"
+)
+
+# Set working directory to the analysis folder
+# Uncomment if running interactively:
+# setwd("Causal Impact/Credit Boost Steve Madden January 2025")
+```
+
+# Executive Summary
+
+This analysis measures the causal impact of the **Steve Madden Credit Booster** ($1,000 increase) on the number of originated loans. The Credit Booster ran from **September 8, 2025** to **November 18, 2025**.
+
+**Key Question:** Did the credit booster result in incremental loans that would not have occurred otherwise?
+
+**Methodology:** We use the CausalImpact package, which implements Bayesian structural time-series models to estimate the counterfactual (what would have happened without the intervention) using control merchants as predictors.
+
+---
+
+# 1. Setup and Configuration
+
+## 1.1 Load Required Packages
+
+```{r load-packages}
+# Install and load required packages
+packages <- c(
+  "CausalImpact",  # Causal inference
+
+"bigrquery",     # BigQuery connection
+  "DBI",           # Database interface
+  "dplyr",         # Data manipulation
+  "tidyr",         # Data tidying
+  "lubridate",     # Date handling
+  "ggplot2",       # Visualization
+  "zoo",           # Time series
+  "corrplot",      # Correlation plots
+  "scales",        # Scale formatting
+  "knitr",         # Tables
+  "kableExtra"     # Table styling
+)
+
+# Install missing packages
+new_packages <- packages[!(packages %in% installed.packages()[, "Package"])]
+if (length(new_packages) > 0) {
+  install.packages(new_packages, repos = "https://cloud.r-project.org/")
+}
+
+# Load all packages
+invisible(lapply(packages, library, character.only = TRUE))
+
+# Load helper functions
+source("utils/bigquery_helpers.R")
+```
+
+## 1.2 Analysis Parameters
+
+```{r config}
+# ============================================================================
+# CONFIGURABLE PARAMETERS - Modify these as needed
+# ============================================================================
+
+# BigQuery Project ID
+BQ_PROJECT_ID <- "your-project-id"  # <-- UPDATE THIS
+
+# Treatment merchant
+TREATMENT_MERCHANT_ID <- 4896  # Steve Madden (collapsed from holding_id = 9)
+TREATMENT_NAME <- "Steve Madden"
+
+# Intervention period
+INTERVENTION_START <- as.Date("2025-09-08")
+INTERVENTION_END <- as.Date("2025-11-18")
+
+# Data period
+DATA_START <- as.Date("2025-01-01")
+DATA_END <- NULL  # NULL = current_date - 23 days
+
+# A/A Test period (for model validation)
+AA_TEST_START <- as.Date("2025-01-01")
+AA_TEST_END <- as.Date("2025-03-31")
+AA_PSEUDO_INTERVENTION <- as.Date("2025-02-15")  # Fake intervention date for A/A test
+
+# Model parameters
+MODEL_PARAMS <- list(
+  niter = 1000,           # MCMC iterations (try: 1000, 5000, 10000)
+  nseasons = 7,           # Weekly seasonality
+  season.duration = 1,    # Duration of each season
+  standardize.data = TRUE # Standardize covariates
+)
+
+# Control selection
+TOP_N_CONTROLS <- 15      # Number of top-correlated controls to use
+MIN_CORRELATION <- 0.3    # Minimum correlation threshold
+
+# Validation thresholds
+MAPE_THRESHOLD <- 0.15    # Maximum acceptable MAPE (15%)
+AA_P_VALUE_THRESHOLD <- 0.05  # A/A test should NOT find significance
+
+# Metric to analyze
+METRIC <- "loans_originated"  # Options: "loans_originated", "npp", "loan_dq_ratio"
+
+# Output directory
+OUTPUT_DIR <- "outputs"
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+```
+
+---
+
+# 2. Data Fetching
+
+## 2.1 Authenticate and Fetch Data
+
+```{r fetch-data, eval=FALSE}
+# Set project and authenticate
+set_bq_project(BQ_PROJECT_ID)
+authenticate_bq()
+
+# Fetch loan data
+raw_data <- fetch_loan_data(
+  start_date = DATA_START,
+  end_date = DATA_END
+)
+
+# Save raw data for reproducibility
+saveRDS(raw_data, file.path(OUTPUT_DIR, "raw_loan_data.rds"))
+```
+
+```{r load-data}
+# For reproducibility, load cached data if available
+if (file.exists(file.path(OUTPUT_DIR, "raw_loan_data.rds"))) {
+  raw_data <- readRDS(file.path(OUTPUT_DIR, "raw_loan_data.rds"))
+  message("Loaded cached data from: ", file.path(OUTPUT_DIR, "raw_loan_data.rds"))
+} else {
+  message("No cached data found. Please run the fetch-data chunk with eval=TRUE")
+  # For demonstration, create sample structure
+  stop("Please fetch data from BigQuery first by setting eval=TRUE in the fetch-data chunk")
+}
+```
+
+## 2.2 Data Quality Check
+
+```{r data-quality}
+# Summary statistics
+quality_summary <- data_quality_summary(raw_data)
+
+cat("Data Quality Summary\n")
+cat("====================\n")
+cat(sprintf("Total rows: %d\n", quality_summary$n_rows))
+cat(sprintf("Date range: %s to %s\n", 
+            quality_summary$date_range[1], 
+            quality_summary$date_range[2]))
+cat(sprintf("Number of merchants: %d\n", quality_summary$n_merchants))
+cat(sprintf("Treatment records: %d\n", quality_summary$n_treatment))
+cat(sprintf("Control records: %d\n", quality_summary$n_control))
+
+# Show first few rows
+kable(head(raw_data, 10), caption = "Sample of Raw Data") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## 2.3 Prepare Time Series Data
+
+```{r prepare-data}
+# Get treatment time series
+treatment_ts <- get_treatment_data(raw_data, METRIC)
+names(treatment_ts)[2] <- "steve_madden"
+
+# Get control merchants data
+control_wide <- get_control_data(raw_data, METRIC)
+
+# Merge treatment and control
+analysis_data <- treatment_ts %>%
+  left_join(control_wide, by = "loan_request_date_local") %>%
+  fill_missing_dates(date_col = "loan_request_date_local", fill_value = 0)
+
+# Convert to proper column names (remove special characters)
+names(analysis_data) <- gsub("[^a-zA-Z0-9_]", "_", names(analysis_data))
+
+cat(sprintf("\nAnalysis data: %d days, %d merchants (1 treatment + %d controls)\n",
+            nrow(analysis_data),
+            ncol(analysis_data) - 1,
+            ncol(analysis_data) - 2))
+```
+
+---
+
+# 3. Correlation Analysis for Control Selection {#correlation}
+
+The CausalImpact model uses control time series to build a counterfactual prediction. Selecting highly correlated controls improves model accuracy and reduces noise.
+
+## 3.1 Calculate Correlations
+
+```{r correlation-calc}
+# Use only pre-intervention period for correlation
+pre_intervention_data <- analysis_data %>%
+  filter(loan_request_date_local < INTERVENTION_START)
+
+# Extract treatment and control columns
+treatment_col <- "steve_madden"
+control_cols <- setdiff(names(pre_intervention_data), 
+                        c("loan_request_date_local", treatment_col))
+
+# Calculate correlations with treatment
+correlations <- sapply(control_cols, function(col) {
+  cor(pre_intervention_data[[treatment_col]], 
+      pre_intervention_data[[col]], 
+      use = "complete.obs")
+})
+
+# Create correlation data frame
+correlation_df <- data.frame(
+  merchant = names(correlations),
+  correlation = as.numeric(correlations),
+  stringsAsFactors = FALSE
+) %>%
+  arrange(desc(correlation)) %>%
+  mutate(
+    rank = row_number(),
+    selected = rank <= TOP_N_CONTROLS & correlation >= MIN_CORRELATION
+  )
+
+# Display top correlations
+kable(head(correlation_df, 20), 
+      caption = "Top 20 Control Merchants by Correlation with Steve Madden",
+      digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(which(head(correlation_df, 20)$selected), background = "#d4edda")
+```
+
+## 3.2 Correlation Visualization
+
+```{r correlation-plot, fig.width=10, fig.height=6}
+# Bar plot of top correlations
+top_corr <- head(correlation_df, 25)
+
+ggplot(top_corr, aes(x = reorder(merchant, correlation), y = correlation, 
+                      fill = selected)) +
+  geom_col() +
+  geom_hline(yintercept = MIN_CORRELATION, linetype = "dashed", color = "red") +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#28a745", "FALSE" = "#6c757d"),
+                    labels = c("TRUE" = "Selected", "FALSE" = "Not Selected")) +
+  labs(
+    title = "Correlation of Control Merchants with Steve Madden",
+    subtitle = sprintf("Pre-intervention period: %s to %s", DATA_START, INTERVENTION_START - 1),
+    x = "Merchant",
+    y = "Pearson Correlation",
+    fill = "Control Selection"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text.y = element_text(size = 8)
+  ) +
+  annotate("text", x = 2, y = MIN_CORRELATION + 0.02, 
+           label = sprintf("Min threshold: %.2f", MIN_CORRELATION),
+           color = "red", hjust = 0)
+
+ggsave(file.path(OUTPUT_DIR, "control_correlation_barplot.png"), 
+       width = 10, height = 6, dpi = 150)
+```
+
+## 3.3 Select Final Controls
+
+```{r select-controls}
+# Get selected control merchants
+selected_controls <- correlation_df %>%
+  filter(selected) %>%
+  pull(merchant)
+
+cat(sprintf("\nSelected %d control merchants with correlation >= %.2f\n",
+            length(selected_controls), MIN_CORRELATION))
+cat("\nSelected merchants:\n")
+cat(paste(selected_controls, collapse = "\n"))
+
+# Create final analysis dataset with selected controls only
+final_data <- analysis_data %>%
+  select(loan_request_date_local, steve_madden, all_of(selected_controls))
+
+# Save control selection
+write.csv(correlation_df, 
+          file.path(OUTPUT_DIR, "merchant_correlations.csv"), 
+          row.names = FALSE)
+```
+
+---
+
+# 4. A/A Test Validation {#aa-test}
+
+Before running the main analysis, we validate the model using an A/A test on a period with no intervention. If the model detects a significant effect, it indicates potential issues with model fit or biases.
+
+## 4.1 A/A Test Setup
+
+```{r aa-test-setup}
+# Filter data for A/A test period
+aa_data <- final_data %>%
+  filter(loan_request_date_local >= AA_TEST_START &
+         loan_request_date_local <= AA_TEST_END)
+
+cat(sprintf("A/A Test Period: %s to %s\n", AA_TEST_START, AA_TEST_END))
+cat(sprintf("Pseudo-intervention date: %s\n", AA_PSEUDO_INTERVENTION))
+cat(sprintf("Pre-period: %d days\n", 
+            sum(aa_data$loan_request_date_local < AA_PSEUDO_INTERVENTION)))
+cat(sprintf("Post-period: %d days\n", 
+            sum(aa_data$loan_request_date_local >= AA_PSEUDO_INTERVENTION)))
+```
+
+## 4.2 Run A/A Test
+
+```{r aa-test-run}
+# Prepare time series for CausalImpact
+aa_ts <- zoo(
+  aa_data[, -1],  # Exclude date column
+  order.by = aa_data$loan_request_date_local
+)
+
+# Define periods for A/A test
+aa_pre_period <- as.Date(c(AA_TEST_START, AA_PSEUDO_INTERVENTION - 1))
+aa_post_period <- as.Date(c(AA_PSEUDO_INTERVENTION, AA_TEST_END))
+
+# Run CausalImpact with A/A test
+aa_impact <- CausalImpact(
+  data = aa_ts,
+  pre.period = aa_pre_period,
+  post.period = aa_post_period,
+  model.args = MODEL_PARAMS
+)
+
+# Extract summary
+aa_summary <- summary(aa_impact)
+print(aa_summary)
+```
+
+## 4.3 A/A Test Results
+
+```{r aa-test-results, fig.width=12, fig.height=8}
+# Plot A/A test results
+plot(aa_impact) +
+  ggtitle("A/A Test: No Intervention Expected") +
+  theme_minimal()
+
+ggsave(file.path(OUTPUT_DIR, "aa_test_results.png"), 
+       width = 12, height = 8, dpi = 150)
+
+# Check if A/A test passed
+aa_report <- summary(aa_impact, "report")
+aa_pvalue <- aa_impact$summary$p[1]
+
+cat("\n========================================\n")
+cat("A/A TEST VALIDATION RESULTS\n")
+cat("========================================\n")
+cat(sprintf("P-value: %.4f\n", aa_pvalue))
+
+if (aa_pvalue > AA_P_VALUE_THRESHOLD) {
+  cat("RESULT: PASSED - No spurious effect detected\n")
+  cat("The model is suitable for the main analysis.\n")
+  aa_test_passed <- TRUE
+} else {
+  cat("RESULT: WARNING - Spurious effect detected!\n")
+  cat("Consider reviewing control selection or model parameters.\n")
+  aa_test_passed <- FALSE
+}
+```
+
+## 4.4 Calculate Weighted MAPE
+
+```{r mape-calculation}
+#' Calculate Weighted MAPE
+#' @param actual Actual values
+#' @param predicted Predicted values
+#' @param weights Optional weights (default: equal weights)
+#' @return Weighted MAPE value
+calculate_weighted_mape <- function(actual, predicted, weights = NULL) {
+  if (is.null(weights)) {
+    weights <- rep(1, length(actual))
+  }
+  
+  # Avoid division by zero
+  valid_idx <- actual != 0
+  
+  if (sum(valid_idx) == 0) {
+    return(NA)
+  }
+  
+  ape <- abs(actual[valid_idx] - predicted[valid_idx]) / abs(actual[valid_idx])
+  w <- weights[valid_idx]
+  
+  weighted_mape <- sum(ape * w) / sum(w)
+  return(weighted_mape)
+}
+
+# Calculate MAPE on A/A test post-period
+aa_post_data <- aa_impact$series[index(aa_impact$series) >= AA_PSEUDO_INTERVENTION, ]
+aa_actual <- as.numeric(aa_post_data[, "response"])
+aa_predicted <- as.numeric(aa_post_data[, "point.pred"])
+
+aa_mape <- calculate_weighted_mape(aa_actual, aa_predicted)
+
+cat(sprintf("\nWeighted MAPE on A/A Test: %.2f%%\n", aa_mape * 100))
+
+if (aa_mape <= MAPE_THRESHOLD) {
+  cat(sprintf("RESULT: PASSED - MAPE (%.2f%%) is below threshold (%.2f%%)\n", 
+              aa_mape * 100, MAPE_THRESHOLD * 100))
+  mape_passed <- TRUE
+} else {
+  cat(sprintf("RESULT: WARNING - MAPE (%.2f%%) exceeds threshold (%.2f%%)\n", 
+              aa_mape * 100, MAPE_THRESHOLD * 100))
+  cat("Consider adjusting model parameters or control selection.\n")
+  mape_passed <- FALSE
+}
+```
+
+---
+
+# 5. CausalImpact Analysis {#main-analysis}
+
+## 5.1 Define Analysis Periods
+
+```{r define-periods}
+# Pre-period: from data start to day before intervention
+pre_period <- as.Date(c(DATA_START, INTERVENTION_START - 1))
+
+# Post-period: intervention period
+post_period <- as.Date(c(INTERVENTION_START, INTERVENTION_END))
+
+cat("Analysis Periods:\n")
+cat(sprintf("  Pre-period:  %s to %s (%d days)\n", 
+            pre_period[1], pre_period[2],
+            as.numeric(pre_period[2] - pre_period[1]) + 1))
+cat(sprintf("  Post-period: %s to %s (%d days)\n", 
+            post_period[1], post_period[2],
+            as.numeric(post_period[2] - post_period[1]) + 1))
+```
+
+## 5.2 Prepare Data for Model
+
+```{r prepare-model-data}
+# Filter data to analysis period
+model_data <- final_data %>%
+  filter(loan_request_date_local >= pre_period[1] &
+         loan_request_date_local <= post_period[2])
+
+# Convert to zoo time series
+model_ts <- zoo(
+  model_data[, -1],  # Exclude date column
+  order.by = model_data$loan_request_date_local
+)
+
+cat(sprintf("\nModel data prepared: %d observations\n", nrow(model_data)))
+cat(sprintf("Treatment variable: steve_madden\n"))
+cat(sprintf("Control variables: %d merchants\n", ncol(model_data) - 2))
+```
+
+## 5.3 Run CausalImpact Model
+
+```{r run-causal-impact}
+# Run the main CausalImpact analysis
+impact <- CausalImpact(
+  data = model_ts,
+  pre.period = pre_period,
+  post.period = post_period,
+  model.args = MODEL_PARAMS
+)
+
+# Print summary
+print(summary(impact))
+```
+
+## 5.4 Model Diagnostics
+
+```{r model-diagnostics}
+# Calculate MAPE on post-period
+post_data <- impact$series[index(impact$series) >= INTERVENTION_START, ]
+actual <- as.numeric(post_data[, "response"])
+predicted <- as.numeric(post_data[, "point.pred"])
+
+model_mape <- calculate_weighted_mape(actual, predicted)
+
+# Extract key metrics
+impact_summary <- impact$summary
+
+diagnostics <- data.frame(
+  Metric = c(
+    "Average Daily Effect",
+    "Cumulative Effect",
+    "Relative Effect (%)",
+    "P-value",
+    "Posterior Probability of Effect",
+    "95% CI Lower (Cumulative)",
+    "95% CI Upper (Cumulative)",
+    "Post-Period MAPE (%)"
+  ),
+  Value = c(
+    round(impact_summary$AbsEffect[1], 2),
+    round(impact_summary$AbsEffect[2], 2),
+    round(impact_summary$RelEffect[2] * 100, 2),
+    round(impact_summary$p[1], 4),
+    round(1 - impact_summary$p[1], 4),
+    round(impact_summary$AbsEffect.lower[2], 2),
+    round(impact_summary$AbsEffect.upper[2], 2),
+    round(model_mape * 100, 2)
+  )
+)
+
+kable(diagnostics, caption = "Model Diagnostics and Key Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Save diagnostics
+write.csv(diagnostics, 
+          file.path(OUTPUT_DIR, "model_diagnostics.csv"), 
+          row.names = FALSE)
+```
+
+---
+
+# 6. Results and Visualizations {#results}
+
+## 6.1 Main CausalImpact Plot
+
+```{r main-plot, fig.width=12, fig.height=10}
+# Create the main CausalImpact visualization
+plot(impact) +
+  labs(
+    title = "Causal Impact Analysis: Steve Madden Credit Booster",
+    subtitle = sprintf("Intervention Period: %s to %s", 
+                       INTERVENTION_START, INTERVENTION_END)
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12, color = "gray40")
+  )
+
+ggsave(file.path(OUTPUT_DIR, "causal_impact_summary.png"), 
+       width = 12, height = 10, dpi = 150)
+```
+
+## 6.2 Daily Effects
+
+```{r daily-effects}
+# Extract daily effects
+daily_effects <- data.frame(
+  date = index(impact$series),
+  actual = as.numeric(impact$series[, "response"]),
+  predicted = as.numeric(impact$series[, "point.pred"]),
+  effect = as.numeric(impact$series[, "point.effect"]),
+  effect_lower = as.numeric(impact$series[, "point.effect.lower"]),
+  effect_upper = as.numeric(impact$series[, "point.effect.upper"]),
+  cumulative = as.numeric(impact$series[, "cum.effect"]),
+  cumulative_lower = as.numeric(impact$series[, "cum.effect.lower"]),
+  cumulative_upper = as.numeric(impact$series[, "cum.effect.upper"])
+) %>%
+  mutate(
+    period = ifelse(date < INTERVENTION_START, "Pre-Intervention", "Post-Intervention")
+  )
+
+# Filter to post-intervention period for effects table
+post_effects <- daily_effects %>%
+  filter(period == "Post-Intervention")
+
+# Summary statistics
+cat("\n========================================\n")
+cat("DAILY EFFECTS SUMMARY (Post-Intervention)\n")
+cat("========================================\n")
+cat(sprintf("Average daily actual loans: %.1f\n", mean(post_effects$actual)))
+cat(sprintf("Average daily predicted (counterfactual): %.1f\n", mean(post_effects$predicted)))
+cat(sprintf("Average daily effect: %.1f loans\n", mean(post_effects$effect)))
+cat(sprintf("Total days in intervention: %d\n", nrow(post_effects)))
+cat(sprintf("Cumulative effect: %.0f loans\n", tail(post_effects$cumulative, 1)))
+
+# Save daily effects
+write.csv(daily_effects, 
+          file.path(OUTPUT_DIR, "daily_effects.csv"), 
+          row.names = FALSE)
+
+# Display sample
+kable(tail(post_effects, 10), 
+      caption = "Last 10 Days of Post-Intervention Effects",
+      digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## 6.3 Custom Visualization: Actual vs Counterfactual
+
+```{r custom-viz, fig.width=12, fig.height=6}
+ggplot(daily_effects, aes(x = date)) +
+  # Intervention period shading
+  annotate("rect", 
+           xmin = INTERVENTION_START, xmax = INTERVENTION_END,
+           ymin = -Inf, ymax = Inf,
+           fill = "#e8f4ea", alpha = 0.5) +
+  # Actual values
+  geom_line(aes(y = actual, color = "Actual"), linewidth = 0.8) +
+  # Predicted counterfactual
+  geom_line(aes(y = predicted, color = "Counterfactual"), 
+            linewidth = 0.8, linetype = "dashed") +
+  # Confidence interval
+  geom_ribbon(aes(ymin = predicted - 1.96 * (effect - effect_lower),
+                  ymax = predicted + 1.96 * (effect_upper - effect)),
+              fill = "#4a90d9", alpha = 0.2) +
+  # Styling
+  scale_color_manual(
+    values = c("Actual" = "#2c3e50", "Counterfactual" = "#e74c3c"),
+    name = ""
+  ) +
+  geom_vline(xintercept = INTERVENTION_START, linetype = "dashed", 
+             color = "#27ae60", linewidth = 1) +
+  annotate("text", x = INTERVENTION_START + 5, y = max(daily_effects$actual) * 0.95,
+           label = "Credit Booster\nStart", hjust = 0, color = "#27ae60", fontface = "bold") +
+  labs(
+    title = sprintf("Steve Madden: Actual vs Counterfactual %s", 
+                    tools::toTitleCase(gsub("_", " ", METRIC))),
+    subtitle = "Shaded area represents the intervention period",
+    x = "Date",
+    y = tools::toTitleCase(gsub("_", " ", METRIC)),
+    caption = sprintf("Data source: analytics.obt_loan | Analysis date: %s", Sys.Date())
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray40"),
+    legend.position = "top"
+  )
+
+ggsave(file.path(OUTPUT_DIR, "actual_vs_counterfactual.png"), 
+       width = 12, height = 6, dpi = 150)
+```
+
+## 6.4 Cumulative Effect Over Time
+
+```{r cumulative-plot, fig.width=12, fig.height=5}
+# Plot cumulative effect during intervention
+post_effects_plot <- daily_effects %>%
+  filter(period == "Post-Intervention")
+
+ggplot(post_effects_plot, aes(x = date)) +
+  geom_ribbon(aes(ymin = cumulative_lower, ymax = cumulative_upper),
+              fill = "#28a745", alpha = 0.3) +
+  geom_line(aes(y = cumulative), color = "#28a745", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Cumulative Incremental Loans from Credit Booster",
+    subtitle = sprintf("Steve Madden: %s to %s", INTERVENTION_START, INTERVENTION_END),
+    x = "Date",
+    y = "Cumulative Incremental Loans",
+    caption = "Shaded area represents 95% credible interval"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray40")
+  ) +
+  scale_y_continuous(labels = scales::comma)
+
+ggsave(file.path(OUTPUT_DIR, "cumulative_effect.png"), 
+       width = 12, height = 5, dpi = 150)
+```
+
+---
+
+# 7. Summary Report
+
+```{r summary-report}
+# Generate final summary
+cat("\n")
+cat("================================================================================\n")
+cat("                    CAUSAL IMPACT ANALYSIS: SUMMARY REPORT                      \n")
+cat("================================================================================\n")
+cat("\n")
+cat("TREATMENT: Steve Madden Credit Booster ($1,000 increase)\n")
+cat(sprintf("INTERVENTION PERIOD: %s to %s (%d days)\n", 
+            INTERVENTION_START, INTERVENTION_END,
+            as.numeric(INTERVENTION_END - INTERVENTION_START) + 1))
+cat("\n")
+cat("MODEL VALIDATION:\n")
+cat(sprintf("  - A/A Test: %s (p-value: %.4f)\n", 
+            ifelse(aa_test_passed, "PASSED", "FAILED"), aa_pvalue))
+cat(sprintf("  - MAPE: %s (%.2f%% vs %.2f%% threshold)\n",
+            ifelse(mape_passed, "PASSED", "WARNING"), aa_mape * 100, MAPE_THRESHOLD * 100))
+cat(sprintf("  - Controls used: %d merchants\n", length(selected_controls)))
+cat("\n")
+cat("KEY FINDINGS:\n")
+cat(sprintf("  - Average daily effect: %.1f incremental loans\n", 
+            impact_summary$AbsEffect[1]))
+cat(sprintf("  - Cumulative effect: %.0f incremental loans\n", 
+            impact_summary$AbsEffect[2]))
+cat(sprintf("  - Relative effect: %.1f%% increase vs counterfactual\n", 
+            impact_summary$RelEffect[2] * 100))
+cat(sprintf("  - 95%% Credible Interval: [%.0f, %.0f] loans\n",
+            impact_summary$AbsEffect.lower[2], impact_summary$AbsEffect.upper[2]))
+cat("\n")
+cat("STATISTICAL SIGNIFICANCE:\n")
+cat(sprintf("  - P-value: %.4f\n", impact_summary$p[1]))
+cat(sprintf("  - Posterior probability of causal effect: %.1f%%\n", 
+            (1 - impact_summary$p[1]) * 100))
+
+if (impact_summary$p[1] < 0.05) {
+  cat("\n  CONCLUSION: The credit booster had a STATISTICALLY SIGNIFICANT positive\n")
+  cat("  effect on the number of originated loans at Steve Madden.\n")
+} else {
+  cat("\n  CONCLUSION: The credit booster did NOT have a statistically significant\n")
+  cat("  effect on the number of originated loans at Steve Madden.\n")
+}
+
+cat("\n")
+cat("================================================================================\n")
+cat("                              END OF REPORT                                     \n")
+cat("================================================================================\n")
+```
+
+## Full CausalImpact Report
+
+```{r full-report}
+# Print the full narrative report from CausalImpact
+summary(impact, "report")
+```
+
+---
+
+# 8. Model Sensitivity Analysis
+
+Test the model with different parameter configurations to ensure robustness.
+
+```{r sensitivity-analysis, eval=FALSE}
+# Define parameter combinations to test
+param_grid <- list(
+  list(niter = 1000, nseasons = 7),
+  list(niter = 5000, nseasons = 7),
+  list(niter = 10000, nseasons = 7),
+  list(niter = 5000, nseasons = 1)  # No seasonality
+)
+
+sensitivity_results <- lapply(seq_along(param_grid), function(i) {
+  params <- param_grid[[i]]
+  
+  impact_test <- CausalImpact(
+    data = model_ts,
+    pre.period = pre_period,
+    post.period = post_period,
+    model.args = params
+  )
+  
+  data.frame(
+    config = paste0("Config_", i),
+    niter = params$niter,
+    nseasons = params$nseasons,
+    cumulative_effect = impact_test$summary$AbsEffect[2],
+    relative_effect = impact_test$summary$RelEffect[2],
+    p_value = impact_test$summary$p[1]
+  )
+})
+
+sensitivity_df <- do.call(rbind, sensitivity_results)
+
+kable(sensitivity_df, 
+      caption = "Sensitivity Analysis: Effect of Model Parameters",
+      digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+write.csv(sensitivity_df, 
+          file.path(OUTPUT_DIR, "sensitivity_analysis.csv"), 
+          row.names = FALSE)
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
